@@ -1,7 +1,6 @@
 # Computer Networks Mini-Project: HTTP Proxy Server
 
 ## Team Members
-## Team Members
 * Rumman Naser - Core Socket Logic, Concurrency (Multithreading), HTTP Parsing, and Caching Architecture
 * Shreekant Singh - Access Control (Domain Blacklisting), Traffic Logging, Performance Measurements, and Documentation
 
