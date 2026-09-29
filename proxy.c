@@ -34,9 +34,19 @@ int main() {
     printf("Server is listening for connections...\n");
 
     int client_fd;
-    client_fd = accept(server_fd, (struct sockaddr*)&address, (socklen_t*)sizeof(address));
+    socklen_t address_length = sizeof(address);
+    client_fd = accept(server_fd, (struct sockaddr*)&address, &address_length);
 
     printf("Connection accepted from a client!\n");
+
+    //Receive function
+    char receive_buffer[4096] = {0};
+    int readBytes = recv(client_fd, receive_buffer, sizeof(receive_buffer) - 1, 0);
+
+    if (readBytes > 0){
+        printf("Successfully received %d bytes\n", readBytes);
+        printf("%s\n", receive_buffer);
+    }
 
     //close server and client.
     close(server_fd);
