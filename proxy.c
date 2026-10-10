@@ -2,6 +2,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <arpa/inet.h>
+#include <sys/stat.h>
+#include <time.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -9,6 +11,26 @@
 
 //predefined port for now
 #define PORT 8080
+
+void get_timestamp(char *buffer, size_t size) {
+    time_t rawtime;
+    struct tm timeinfo;
+
+    time(&rawtime);
+    localtime_r(&rawtime, &timeinfo); // Thread-safe on WSL/Linux
+
+    strftime(buffer, size, "%Y-%m-%d %H:%M:%S", &timeinfo);
+}
+
+void logMessage(const char *clientip, const char *method, const char *msg){
+    FILE *log = fopen("proxy.log", "a");
+    if(log != NULL){
+	char timestamp[20];
+	get_timestamp(timestamp, sizeof(timestamp));
+	fprintf(log, "[%s] [%s] %s %s\n", timestamp, clientip, method, msg);
+	fclose(log);
+    }
+}
 
 int main() {
     int server_fd;
@@ -20,7 +42,7 @@ int main() {
     }
 
     printf("Socket creation successful!\n");
-
+	
     struct sockaddr_in address;
     address.sin_family = AF_INET;
     address.sin_addr.s_addr = INADDR_ANY;
@@ -32,25 +54,30 @@ int main() {
     //Make server listen passively w/ a backlog of 10 connections rn
     listen(server_fd, 10);
     printf("Server is listening for connections...\n");
+    logMessage("0", "ONLINE", "Server is Online");
+    
+    while(1){
+	    struct sockaddr_in client_addr;
+	    socklen_t client_len = sizeof(client_addr);
+        int client_fd;
+        client_fd = accept(server_fd, (struct sockaddr*)&client_addr, &client_len);
+        
+        if(client_fd >=0){
+        	printf("Connection accepted from a client!\n");
+        	char client_ip[INET_ADDRSTRLEN];
+	        inet_ntop(AF_INET, &(client_addr.sin_addr), client_ip, INET_ADDRSTRLEN);
+	        logMessage(client_ip, "CONNECT", "established");
+        }
 
-    int client_fd;
-    socklen_t address_length = sizeof(address);
-    client_fd = accept(server_fd, (struct sockaddr*)&address, &address_length);
+        //Receive function
+        char receive_buffer[4096] = {0};
+        int readBytes = recv(client_fd, receive_buffer, sizeof(receive_buffer) - 1, 0);
 
-    printf("Connection accepted from a client!\n");
-
-    //Receive function
-    char receive_buffer[4096] = {0};
-    int readBytes = recv(client_fd, receive_buffer, sizeof(receive_buffer) - 1, 0);
-
-    if (readBytes > 0){
-        printf("Successfully received %d bytes\n", readBytes);
-        printf("%s\n", receive_buffer);
-    }
-
-    //close server and client.
-    close(server_fd);
+        if (readBytes > 0){
+            printf("Successfully received %d bytes\n", readBytes);
+            printf("%s\n", receive_buffer);
+        }
+	}
+    //close client only
     close(client_fd);
-
-    return 0;
 }
