@@ -13,6 +13,97 @@
 //predefined port for now
 #define PORT 8080
 
+//caching stuff
+typedef struct CacheNode {
+    char url[256];              
+    char *responseData;        
+    int responseSize;           
+    struct CacheNode *prev;     
+    struct CacheNode *next;     
+} CacheNode;
+
+//cache manager
+typedef struct {
+    CacheNode *head;          
+    CacheNode *tail;           
+    int currentSize;            
+    int maxSize;    
+    pthread_mutex_t lock; //for your multithreading bs, shree           
+} LRUCache;
+
+LRUCache *proxyCache = NULL;
+
+//init
+void initCache(int maxSizeBytes) {
+    proxyCache = (LRUCache *)malloc(sizeof(LRUCache));
+    proxyCache->head = NULL;
+    proxyCache->tail = NULL;
+    proxyCache->currentSize = 0;
+    proxyCache->maxSize = maxSizeBytes;
+    pthread_mutex_init(&proxyCache->lock, NULL);
+    printf("Cache initialized with %d bytes capacity.\n", maxSizeBytes);
+}
+
+CacheNode* findInCache(const char* targetUrl) {
+    CacheNode *current = proxyCache->head;
+    
+    while (current != NULL) {
+        if (strcmp(current->url, targetUrl) == 0) {
+            return current; //cache hit
+        }
+        current = current->next;
+    }
+    
+    return NULL; //cache miss
+}
+
+//big boi cache function
+void insertIntoCache(const char *targetUrl, const char *responseData, int responseSize) {
+    //delete oldest website if max limit reached
+    while (proxyCache->currentSize + responseSize > proxyCache->maxSize && proxyCache->tail != NULL) {
+        CacheNode *oldTail = proxyCache->tail;
+        
+        //disconnect tail from the list
+        proxyCache->tail = oldTail->prev;
+        if (proxyCache->tail != NULL) {
+            proxyCache->tail->next = NULL;
+        } else {
+            proxyCache->head = NULL; //cache is now empty
+        }
+        
+        //free the memory and update the size tracker
+        proxyCache->currentSize -= oldTail->responseSize;
+        free(oldTail->responseData);
+        free(oldTail);
+    }
+
+    CacheNode *newNode = (CacheNode *)malloc(sizeof(CacheNode));
+    strncpy(newNode->url, targetUrl, 255);
+    newNode->url[255] = '\0';
+    
+    //big dynamic copy
+    newNode->responseData = (char *)malloc(responseSize);
+    memcpy(newNode->responseData, responseData, responseSize);
+    newNode->responseSize = responseSize;
+
+    //insert new node at head
+    newNode->next = proxyCache->head;
+    newNode->prev = NULL;
+
+    if (proxyCache->head != NULL) {
+        proxyCache->head->prev = newNode;
+    }
+    proxyCache->head = newNode;
+
+    //first item = tail
+    if (proxyCache->tail == NULL) {
+        proxyCache->tail = newNode;
+    }
+
+    proxyCache->currentSize += responseSize;
+}
+
+//normal functions and stuff
 void get_timestamp(char *buffer, size_t size) {
     time_t rawtime;
     struct tm timeinfo;
@@ -36,6 +127,8 @@ void logMessage(const char *clientip, const char *method, const char *msg){
 int main() {
     int server_fd;
     server_fd = socket(AF_INET, SOCK_STREAM, 0);
+
+    initCache(5242880);
 
     if (server_fd == -1) {
         printf("Socket creation failed!\n");
