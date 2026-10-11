@@ -13,6 +13,8 @@
 //predefined port for now
 #define PORT 8080
 
+pthread_mutex_t log_mutex = PTHREAD_MUTEX_INITIALIZER;
+
 //caching stuff
 typedef struct CacheNode {
     char url[256];              
@@ -33,6 +35,12 @@ typedef struct {
 
 LRUCache *proxyCache = NULL;
 
+//Client args struct passed to worker threads
+typedef struct {
+    int client_fd;
+    struct sockaddr_in client_addr;
+}client_args_t;
+
 //init
 void initCache(int maxSizeBytes) {
     proxyCache = (LRUCache *)malloc(sizeof(LRUCache));
@@ -44,21 +52,26 @@ void initCache(int maxSizeBytes) {
     printf("Cache initialized with %d bytes capacity.\n", maxSizeBytes);
 }
 
+
 CacheNode* findInCache(const char* targetUrl) {
+    pthread_mutex_lock(&proxyCache->lock);
     CacheNode *current = proxyCache->head;
     
     while (current != NULL) {
         if (strcmp(current->url, targetUrl) == 0) {
+	    pthread_mutex_unlock(&proxyCache->lock);
             return current; //cache hit
         }
         current = current->next;
     }
-    
+    pthread_mutex_unlock(&proxyCache->lock);
     return NULL; //cache miss
 }
 
 //big boi cache function
 void insertIntoCache(const char *targetUrl, const char *responseData, int responseSize) {
+    pthread_mutex_lock(&proxyCache->lock);
+
     //delete oldest website if max limit reached
     while (proxyCache->currentSize + responseSize > proxyCache->maxSize && proxyCache->tail != NULL) {
         CacheNode *oldTail = proxyCache->tail;
@@ -101,6 +114,7 @@ void insertIntoCache(const char *targetUrl, const char *responseData, int respon
     }
 
     proxyCache->currentSize += responseSize;
+    pthread_mutex_unlock(&proxyCache->lock);
 }
 
 //normal functions and stuff
@@ -115,6 +129,7 @@ void get_timestamp(char *buffer, size_t size) {
 }
 
 void logMessage(const char *clientip, const char *method, const char *msg){
+    pthread_mutex_lock(&log_mutex);
     FILE *log = fopen("proxy.log", "a");
     if(log != NULL){
 	char timestamp[20];
@@ -122,54 +137,32 @@ void logMessage(const char *clientip, const char *method, const char *msg){
 	fprintf(log, "[%s] [%s] %s %s\n", timestamp, clientip, method, msg);
 	fclose(log);
     }
+    pthread_mutex_unlock(&log_mutex);
 }
 
-int main() {
-    int server_fd;
-    server_fd = socket(AF_INET, SOCK_STREAM, 0);
+//i moved parsing from main to handle_client for multithreading (shree)
+void *handle_client(void *arg){
+    client_args_t *args = (client_args_t *)arg;
+    int client_fd = args->client_fd;
+    struct sockaddr_in client_addr = args->client_addr;
 
-    initCache(5242880);
+    free(args);
+    pthread_detach(pthread_self());
 
-    if (server_fd == -1) {
-        printf("Socket creation failed!\n");
-        return 1;
-    }
+    if(client_fd >=0){
+        printf("Connection accepted from a client!\n");
+        char client_ip[INET_ADDRSTRLEN];
+	 inet_ntop(AF_INET, &(client_addr.sin_addr), client_ip, INET_ADDRSTRLEN);
+	 logMessage(client_ip, "CONNECT", "established");
 
-    printf("Socket creation successful!\n");
-	
-    struct sockaddr_in address;
-    address.sin_family = AF_INET;
-    address.sin_addr.s_addr = INADDR_ANY;
-    address.sin_port = htons(PORT);
+         //Receive function
+         char receive_buffer[4096] = {0};
+         int readBytes = recv(client_fd, receive_buffer, sizeof(receive_buffer) - 1, 0);
 
-    bind(server_fd, (struct sockaddr*)&address, sizeof(address));
-    printf("Server bound to port: %d\n", PORT);
-
-    //Make server listen passively w/ a backlog of 10 connections rn
-    listen(server_fd, 10);
-    printf("Server is listening for connections...\n");
-    logMessage("0", "ONLINE", "Server is Online");
-    
-    while(1){
-	    struct sockaddr_in client_addr;
-	    socklen_t client_len = sizeof(client_addr);
-        int client_fd;
-        client_fd = accept(server_fd, (struct sockaddr*)&client_addr, &client_len);
-        
-        if(client_fd >=0){
-        	printf("Connection accepted from a client!\n");
-        	char client_ip[INET_ADDRSTRLEN];
-	        inet_ntop(AF_INET, &(client_addr.sin_addr), client_ip, INET_ADDRSTRLEN);
-	        logMessage(client_ip, "CONNECT", "established");
-
-            //Receive function
-            char receive_buffer[4096] = {0};
-            int readBytes = recv(client_fd, receive_buffer, sizeof(receive_buffer) - 1, 0);
-
-            if (readBytes > 0){
-                printf("Successfully received %d bytes\n", readBytes);
-                printf("%s", receive_buffer);
-            }
+         if (readBytes > 0){
+              printf("Successfully received %d bytes\n", readBytes);
+              printf("%s", receive_buffer);
+          }
 
             //storing target domain name
             char target[256] = {0};
@@ -184,9 +177,10 @@ int main() {
                 //Tokenize to separate the host and port
                 char* hostname;
                 char* port;
+		char* saveptr;
 
-                hostname = strtok(target, ":");
-                port = strtok(NULL, ":"); //calling strtok with NULL basiclaly means it'll grab the remaining half
+                hostname = strtok_r(target, ":", &saveptr);
+                port = strtok_r(NULL, ":", &saveptr); //calling strtok with NULL basiclaly means it'll grab the remaining half
 
                 //in case user does not provide a port, fallback to HTTP default
                 if (port == NULL){
@@ -236,11 +230,8 @@ int main() {
                             close(target_fd);
                         }
                         freeaddrinfo(targetInfo);
-                    }
-                        
+                    }                       
                 }
-
-                
 
             } else {
                 printf("ERROR: Host header not found! Contact admin or something..");
@@ -249,7 +240,47 @@ int main() {
             //close client only
             close(client_fd);
         }
-        
-	}
+return NULL;
+}
+	
+int main() {
+    int server_fd;
+    server_fd = socket(AF_INET, SOCK_STREAM, 0);
+
+    initCache(5242880);
+
+    if (server_fd == -1) {
+        printf("Socket creation failed!\n");
+        return 1;
+    }
+
+    printf("Socket creation successful!\n");
+	
+    struct sockaddr_in address;
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = INADDR_ANY;
+    address.sin_port = htons(PORT);
+
+    bind(server_fd, (struct sockaddr*)&address, sizeof(address));
+    printf("Server bound to port: %d\n", PORT);
+
+    //Make server listen passively w/ a backlog of 10 connections rn
+    listen(server_fd, 10);
+    printf("Server is listening for connections...\n");
+    logMessage("0", "ONLINE", "Server is Online");
     
+    while(1){
+    client_args_t *args = (client_args_t *)malloc(sizeof(client_args_t));
+    socklen_t client_len = sizeof(args->client_addr);
+    args->client_fd = accept(server_fd, (struct sockaddr*)&args->client_addr, &client_len);
+    
+    if(args->client_fd>=0){
+	pthread_t thread_id;
+	pthread_create(&thread_id, NULL, handle_client, args);
+    }
+    else free(args);
+
+    }
+    close(server_fd);
+    return 0;
 }
