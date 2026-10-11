@@ -140,6 +140,22 @@ void logMessage(const char *clientip, const char *method, const char *msg){
     pthread_mutex_unlock(&log_mutex);
 }
 
+//domains to blacklist
+const char *blacklist[] = {
+    "kiit.ac.in",
+    NULL
+};
+
+int is_blacklisted(const char *hostname){
+    if(!hostname) return 0;
+
+    for (int i=0; blacklist[i] != NULL; i++){
+	if(strcasecmp(hostname, blacklist[i]) == 0){
+	    return 1;
+	}
+    }
+    return 0; //means not blacklisted
+}
 //i moved parsing from main to handle_client for multithreading (shree)
 void *handle_client(void *arg){
     client_args_t *args = (client_args_t *)arg;
@@ -188,6 +204,23 @@ void *handle_client(void *arg){
                 }
 
                 printf("Parsing Complete.\nHostname: %s\nPort: %s\n", hostname, port);
+
+		//checking if hostname is blacklisted
+		if(is_blacklisted(hostname)){
+		    printf("Target domain %s blocked\n", hostname);
+		    logMessage(client_ip, "BLOCKED", hostname);
+
+		    const char *forbidden_resp =
+			"HTTP/1.1 403 Forbidden\r\n"
+			"Content-Type: text/html\r\n"
+			"Content-Length: 85\r\n"
+			"Connection: close\r\n\r\n"
+			"<html><body><h1>403 Forbidden</h1><p>Access to this domain is blocked.</p></body></html>";
+
+		    send(client_fd, forbidden_resp, strlen(forbidden_resp), 0);
+		    close(client_fd);
+		    return NULL;
+		}
 
                 //now we translate plaintext hostname into an actual IP address
                 struct addrinfo hints, *targetInfo;
