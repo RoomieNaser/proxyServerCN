@@ -53,19 +53,36 @@ void initCache(int maxSizeBytes) {
 }
 
 
+//added LRU head promotion also, mutex now works within the handle_client() function instead of here
 CacheNode* findInCache(const char* targetUrl) {
-    pthread_mutex_lock(&proxyCache->lock);
     CacheNode *current = proxyCache->head;
     
     while (current != NULL) {
         if (strcmp(current->url, targetUrl) == 0) {
-	    pthread_mutex_unlock(&proxyCache->lock);
-            return current; //cache hit
+            if (current != proxyCache->head) {
+                if (current->prev != NULL) {
+                    current->prev->next = current->next;
+                }
+                if (current->next != NULL) {
+                    current->next->prev = current->prev;
+                } else {
+                    //update tail
+                    proxyCache->tail = current->prev;
+                }
+
+                //Place current at head (according to gemini, not done by me)
+                current->next = proxyCache->head;
+                current->prev = NULL;
+                if (proxyCache->head != NULL) {
+                    proxyCache->head->prev = current;
+                }
+                proxyCache->head = current;
+            }
+            return current; //Cache hit!
         }
         current = current->next;
     }
-    pthread_mutex_unlock(&proxyCache->lock);
-    return NULL; //cache miss
+    return NULL; //Cache miss
 }
 
 //big boi cache function
@@ -143,6 +160,8 @@ void logMessage(const char *clientip, const char *method, const char *msg){
 //domains to blacklist
 const char *blacklist[] = {
     "kiit.ac.in",
+    "localhost",
+    "127.0.0.1",
     NULL
 };
 
@@ -156,7 +175,7 @@ int is_blacklisted(const char *hostname){
     }
     return 0; //means not blacklisted
 }
-//i moved parsing from main to handle_client for multithreading (shree)
+//i moved parsing from main to handle_client for multithreading (shree) -- Lmao W nice one (rumi)
 void *handle_client(void *arg){
     client_args_t *args = (client_args_t *)arg;
     int client_fd = args->client_fd;
@@ -172,13 +191,23 @@ void *handle_client(void *arg){
 	 logMessage(client_ip, "CONNECT", "established");
 
          //Receive function
+         //new and improved to be compatible with telnet
          char receive_buffer[4096] = {0};
-         int readBytes = recv(client_fd, receive_buffer, sizeof(receive_buffer) - 1, 0);
+         int readBytes = 0;
+         int bytes;
+
+         while ((bytes = recv(client_fd, receive_buffer + readBytes, sizeof(receive_buffer) - 1 - readBytes, 0)) > 0) {
+             readBytes += bytes;
+             receive_buffer[readBytes] = '\0';
+             if (strstr(receive_buffer, "\r\n\r\n") != NULL || strstr(receive_buffer, "\n\n") != NULL) {
+                 break;
+             }
+         }
 
          if (readBytes > 0){
               printf("Successfully received %d bytes\n", readBytes);
               printf("%s", receive_buffer);
-          }
+         }
 
             //storing target domain name
             char target[256] = {0};
@@ -222,48 +251,77 @@ void *handle_client(void *arg){
 		    return NULL;
 		}
 
-                //now we translate plaintext hostname into an actual IP address
-                struct addrinfo hints, *targetInfo;
-                memset(&hints, 0, sizeof(hints));
-                hints.ai_family = AF_INET;
-                hints.ai_socktype = SOCK_STREAM;
+                    //cache checking
+                    pthread_mutex_lock(&proxyCache->lock);
+                    CacheNode *cachedItem = findInCache(hostname);
+                    if (cachedItem != NULL) {
+                        printf("CACHE HIT for %s!!! Got info from cache memory.\n", hostname);
+                        logMessage(client_ip, "CACHE_HIT", hostname);
+                        send(client_fd, cachedItem->responseData, cachedItem->responseSize, 0);
+                        pthread_mutex_unlock(&proxyCache->lock);
+                        close(client_fd);
+                        return NULL;
+                    }
+                    pthread_mutex_unlock(&proxyCache->lock);
+                    printf("CACHE MISS for %s. Wait, gathering info from the internet...\n", hostname);
+                    logMessage(client_ip, "CACHE_MISS", hostname);
 
-                int status = getaddrinfo(hostname, port, &hints, &targetInfo);
+                    //dns resolution stuff
+                    struct addrinfo hints, *targetInfo;
+                    memset(&hints, 0, sizeof(hints));
+                    hints.ai_family = AF_INET;
+                    hints.ai_socktype = SOCK_STREAM;
 
-                if (status != 0){
-                    printf("DNS ERROR\n");
-                } else {
-                    printf("DNS Resolved.\n");
+                    int status = getaddrinfo(hostname, port, &hints, &targetInfo);
 
-                    int target_fd = socket(targetInfo->ai_family, targetInfo->ai_socktype, targetInfo->ai_protocol);
-                    if (target_fd < 0){
-                        printf("Target socket could not be created :(\n");
+                    if (status != 0){
+                        printf("DNS ERROR\n");
                     } else {
-                        if (connect(target_fd, targetInfo->ai_addr, targetInfo->ai_addrlen) < 0){
-                            printf("Connection to target failed.\n");
+                        printf("DNS Resolved.\n");
+
+                        int target_fd = socket(targetInfo->ai_family, targetInfo->ai_socktype, targetInfo->ai_protocol);
+                        if (target_fd < 0){
+                            printf("Target socket could not be created :(\n");
                         } else {
-                            printf("Connection successful to target server!\n");
-
-                            //forwarding logic
-                            if (send(target_fd, receive_buffer, readBytes, 0) < 0){
-                                printf("Forwarding request to target failed.\n");
+                            if (connect(target_fd, targetInfo->ai_addr, targetInfo->ai_addrlen) < 0){
+                                printf("Connection to target failed.\n");
                             } else {
-                                printf("Request forwarded successfully. Awaiting response :D\n");
+                                printf("Connection successful to target server!\n");
 
-                                char targetResponse[4096];
-                                int targetBytes;
+                                if (send(target_fd, receive_buffer, readBytes, 0) < 0){
+                                    printf("Forwarding request to target failed.\n");
+                                } else {
+                                    printf("Request forwarded successfully. Awaiting response :D\n");
 
-                                while ((targetBytes = recv(target_fd, targetResponse, sizeof(targetResponse), 0)) > 0) {
-                                    send(client_fd, targetResponse, targetBytes, 0);
+                                    char targetResponse[4096];
+                                    int targetBytes;
+
+                                    // Buffer to accumulate the full response for caching (up to 1MB per page)
+                                    int maxPageSize = 1048576; 
+                                    char *fullResponseBuffer = (char *)malloc(maxPageSize);
+                                    int totalResponseBytes = 0;
+
+                                    while ((targetBytes = recv(target_fd, targetResponse, sizeof(targetResponse), 0)) > 0) {
+                                        send(client_fd, targetResponse, targetBytes, 0);
+
+                                        if (totalResponseBytes + targetBytes <= maxPageSize) {
+                                            memcpy(fullResponseBuffer + totalResponseBytes, targetResponse, targetBytes);
+                                        }
+                                        totalResponseBytes += targetBytes;
+                                    }
+
+                                    if (totalResponseBytes > 0 && totalResponseBytes <= maxPageSize) {
+                                        insertIntoCache(hostname, fullResponseBuffer, totalResponseBytes);
+                                        printf("Stored %s in cache (%d bytes).\n", hostname, totalResponseBytes);
+                                    }
+                                    free(fullResponseBuffer);
+
+                                    printf("Response sent to client.\n");
                                 }
-
-                                printf("Response sent to client.\n");
                             }
-
                             close(target_fd);
                         }
-                        freeaddrinfo(targetInfo);
-                    }                       
+                        freeaddrinfo(targetInfo); 
                 }
 
             } else {
